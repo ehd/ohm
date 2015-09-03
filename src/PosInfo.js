@@ -8,6 +8,7 @@ function PosInfo(state) {
   this.state = state;
   this.applicationStack = [];  // a stack of "memo keys" of the active applications
   this.memo = {};
+  this.currentLeftRecursion = undefined;
 }
 
 PosInfo.prototype = {
@@ -25,54 +26,28 @@ PosInfo.prototype = {
     this.applicationStack.pop();
   },
 
-  shouldUseMemoizedResult: function(application, memoRec) {
-    var involvedApplications = memoRec.involvedApplications;
-    if (involvedApplications != null) {
-      var keys = Object.keys(involvedApplications);
-      for (var i = 0; i < keys.length; ++i) {
-        var memoKey = keys[i];
-        if (involvedApplications[memoKey] && this.applicationStack.indexOf(memoKey) !== -1) {
-          return false;
+  startLeftRecursion: function(headApplication, memoRec) {
+    var applicationStack = this.applicationStack;
+    memoRec.nextLeftRecursion = this.currentLeftRecursion;
+    memoRec.headApplication = headApplication;
+    var indexOfFirstInvolvedRule = applicationStack.indexOf(headApplication.toMemoKey()) + 1;
+    var involvedApplications = applicationStack.slice(indexOfFirstInvolvedRule);
+    memoRec.isInvolved = function(application) {
+      return involvedApplications.indexOf(application.toMemoKey()) >= 0;
+    };
+    memoRec.updateInvolvedApplications = function() {
+      for (var idx = indexOfFirstInvolvedRule + 1; idx < applicationStack.length; idx++) {
+        var application = applicationStack[idx];
+        if (!this.isInvolved(application)) {
+          involvedApplications.push(application);
         }
       }
-    }
-    return true;
-  },
-
-  getCurrentLeftRecursion: function() {
-    if (this.leftRecursionStack) {
-      return this.leftRecursionStack[this.leftRecursionStack.length - 1];
-    }
-  },
-
-  startLeftRecursion: function(application) {
-    if (!this.leftRecursionStack) {
-      this.leftRecursionStack = [];
-    }
-    this.leftRecursionStack.push({
-        memoKey: application.toMemoKey(),
-        value: false,
-        pos: -1,
-        involvedApplications: {}});
-    this.updateInvolvedApplications();
+    };
+    this.currentLeftRecursion = memoRec;
   },
 
   endLeftRecursion: function(application) {
-    this.leftRecursionStack.pop();
-  },
-
-  updateInvolvedApplications: function() {
-    var currentLeftRecursion = this.getCurrentLeftRecursion();
-    var involvedApplications = currentLeftRecursion.involvedApplications;
-    var lrApplicationMemoKey = currentLeftRecursion.memoKey;
-    var idx = this.applicationStack.length - 1;
-    while (true) {
-      var memoKey = this.applicationStack[idx--];
-      if (memoKey === lrApplicationMemoKey) {
-        break;
-      }
-      involvedApplications[memoKey] = true;
-    }
+    this.currentLeftRecursion = this.currentLeftRecursion.nextLeftRecursion;
   }
 };
 

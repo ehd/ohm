@@ -297,110 +297,114 @@ pexprs.Obj.prototype._eval = function(state) {
   }
 };
 
-function useMemoizedResult(state, application, memoRecOrLR) {
-  var inputStream = state.inputStream;
-  var bindings = state.bindings;
-
-  inputStream.pos = memoRecOrLR.pos;
+// TODO: refactor this so that it's a method on `MemoRec`s
+// (Maybe LRMemoRec should be a subclass...)
+function useMemoizedResult(state, memoRec) {
+  state.inputStream.pos = memoRec.pos;
   if (state.isTracing()) {
-    state.trace.push(memoRecOrLR.traceEntry);
+    state.trace.push(memoRec.traceEntry);
   }
-  if (memoRecOrLR.value) {
-    bindings.push(memoRecOrLR.value);
+  if (memoRec.value) {
+    state.bindings.push(memoRec.value);
     return true;
   }
   return false;
 }
 
 pexprs.Apply.prototype._eval = function(state) {
-  var inputStream = state.inputStream;
-  var grammar = state.grammar;
-  var bindings = state.bindings;
-
   var caller = state.currentApplication();
   var actuals = caller ? caller.params : [];
-
   var app = this.substituteParams(actuals);
-  var ruleName = app.ruleName;
   var memoKey = app.toMemoKey();
 
-  if (this !== state.applySpaces_ && (state.inSyntacticContext() || app.isSyntactic())) {
+  // Skip whitespace at the application site, if the rule that's being applied is syntactic
+  if (app !== state.applySpaces_ && (state.inSyntacticContext() || app.isSyntactic())) {
     state.skipSpaces();
   }
 
+  var origPosInfo = state.getCurrentPosInfo();
+  var memoRec = origPosInfo.memo[memoKey];
+
+  if (memoRec) {
+    // Just return the result
+    return useMemoizedResult(state, memoRec);
+  }
+
+  if (origPosInfo.isActive(app)) {
+    // Left recursion detected, so we memoize a failure to try to get to a "base case"
+    memoRec = origPosInfo.memo[memoKey] = {pos: -1, value: false};
+    origPosInfo.startLeftRecursion(app, memoRec);
+    return false;
+  }
+
+  return app.reallyEval(state, !caller);
+};
+
+pexprs.Apply.prototype.reallyEval = function(state, isTopLevelApplication) {
+  var inputStream = state.inputStream;
   var origPos = inputStream.pos;
   var origPosInfo = state.getCurrentPosInfo();
+  var grammar = state.grammar;
+  var bindings = state.bindings;
 
-  var memoRec = origPosInfo.memo[memoKey];
-  var currentLR;
-  if (memoRec && origPosInfo.shouldUseMemoizedResult(this, memoRec)) {
-    return useMemoizedResult(state, this, memoRec);
-  } else if (origPosInfo.isActive(app)) {
-    currentLR = origPosInfo.getCurrentLeftRecursion();
-    if (currentLR && currentLR.memoKey === memoKey) {
-      origPosInfo.updateInvolvedApplications();
-      return useMemoizedResult(state, this, currentLR);
-    } else {
-      origPosInfo.startLeftRecursion(app);
-      return false;
-    }
+  var ruleName = this.ruleName;
+  var body = grammar.ruleDict[ruleName];
+
+  origPosInfo.enter(this);
+
+  if (body.description) {
+    state.doNotRecordFailures();
+  }
+
+  var value = this.evalOnce(body, state);
+  var currentLR = origPosInfo.currentLeftRecursion;
+  var memoKey = this.toMemoKey();
+  if (currentLR && this === currentLR.headApplication) {
+    var lrMemoRec = origPosInfo.memo[memoKey];
+    value = this.growSeedResult(body, state, origPos, lrMemoRec, value);
+    origPosInfo.endLeftRecursion(this);
+  } else if (currentLR && currentLR.isInvolved(this)) {
+    // Don't memoize the result
   } else {
-    var body = grammar.ruleDict[ruleName];
-    origPosInfo.enter(app);
-    if (body.description) {
-      state.doNotRecordFailures();
-    }
-    var value = app.evalOnce(body, state);
-    currentLR = origPosInfo.getCurrentLeftRecursion();
-    if (currentLR) {
-      if (currentLR.memoKey === memoKey) {
-        value = app.handleLeftRecursion(body, state, origPos, currentLR, value);
-        origPosInfo.memo[memoKey] = {
-          pos: inputStream.pos,
-          value: value,
-          involvedApplications: currentLR.involvedApplications
-        };
-        origPosInfo.endLeftRecursion(app);
-      } else if (!currentLR.involvedApplications[memoKey]) {
-        // Only memoize if this application is not involved in the current left recursion
-        origPosInfo.memo[memoKey] = {pos: inputStream.pos, value: value};
-      }
-    } else {
-      origPosInfo.memo[memoKey] = {pos: inputStream.pos, value: value};
-    }
-    if (body.description) {
-      state.doRecordFailures();
-      if (!value) {
-        state.recordFailure(origPos, app);
-      }
-    }
-    // Record trace information in the memo table, so that it is
-    // available if the memoized result is used later.
-    if (state.isTracing() && origPosInfo.memo[memoKey]) {
-      var entry = state.getTraceEntry(origPos, app, value);
-      entry.setLeftRecursive(currentLR && (currentLR.memoKey === memoKey));
-      origPosInfo.memo[memoKey].traceEntry = entry;
-    }
-    var ans;
-    if (value) {
-      bindings.push(value);
-      if (!caller) {
-        if (app.isSyntactic()) {
-          state.skipSpaces();
-        }
-        // Only succeed if the top-level rule has consumed all of the input.
-        // (The following will ignore spaces if the rule is syntactic.)
-        ans = pexprs.end.eval(state);
-        bindings.pop();  // pop the binding that was added by `end` in the statement above
-      } else {
-        ans = true;
-      }
-    } else {
-      ans = false;
-    }
+    origPosInfo.memo[memoKey] = {pos: inputStream.pos, value: value};
+  }
 
-    origPosInfo.exit();
-    return ans;
+  if (body.description) {
+    state.doRecordFailures();
+    if (!value) {
+      state.recordFailure(origPos, this);
+    }
+  }
+
+  // Record trace information in the memo table, so that it is
+  // available if the memoized result is used later.
+  if (state.isTracing() && origPosInfo.memo[memoKey]) {
+    var entry = state.getTraceEntry(origPos, this, value);
+    entry.setLeftRecursive(currentLR && (currentLR.memoKey === memoKey));
+    origPosInfo.memo[memoKey].traceEntry = entry;
+  }
+
+  origPosInfo.exit();
+
+  if (value) {
+    bindings.push(value);
+    if (isTopLevelApplication) {
+      if (this.isSyntactic()) {
+        state.skipSpaces();
+      }
+      // Only succeed if the top-level rule has consumed all of the input.
+      // (The following will ignore spaces if the rule is syntactic.)
+      var ans = pexprs.end.eval(state);
+      if (ans) {
+        bindings.pop();  // pop the binding that was added by `end` in the statement above
+        return true;
+      } else {
+        return false;
+      }
+    }
+    return value;
+  } else {
+    return false;
   }
 };
 
@@ -417,37 +421,29 @@ pexprs.Apply.prototype.evalOnce = function(expr, state) {
   }
 };
 
-pexprs.Apply.prototype.handleLeftRecursion = function(body, state, origPos, currentLR, seedValue) {
+pexprs.Apply.prototype.growSeedResult = function(body, state, origPos, lrMemoRec, seedValue) {
   if (!seedValue) {
-    return seedValue;
+    return false;
   }
 
   var inputStream = state.inputStream;
-  var value = seedValue;
-  currentLR.value = seedValue;
-  currentLR.pos = inputStream.pos;
-
   while (true) {
     if (state.isTracing()) {
-      currentLR.traceEntry = common.clone(state.trace[state.trace.length - 1]);
+      lrMemoRec.traceEntry = common.clone(state.trace[state.trace.length - 1]);
     }
-
     inputStream.pos = origPos;
-    value = this.evalOnce(body, state);
-    if (value && inputStream.pos > currentLR.pos) {
-      // The left-recursive result was expanded -- keep looping.
-      currentLR.value = value;
-      currentLR.pos = inputStream.pos;
-    } else {
-      // Failed to expand the result.
-      inputStream.pos = currentLR.pos;
-      if (state.isTracing()) {
-        state.trace.pop();  // Drop last trace entry since `value` was unused.
-      }
+    var newValue = this.evalOnce(body, state);
+    if (inputStream.pos <= lrMemoRec.pos) {
       break;
     }
+    lrMemoRec.pos = inputStream.pos;
+    lrMemoRec.value = newValue;
   }
-  return currentLR.value;
+  if (state.isTracing()) {
+    state.trace.pop();  // Drop last trace entry since `value` was unused.
+  }
+  inputStream.pos = lrMemoRec.pos;
+  return lrMemoRec.value;
 };
 
 pexprs.UnicodeChar.prototype._eval = function(state) {
